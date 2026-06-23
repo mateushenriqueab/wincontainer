@@ -1,154 +1,167 @@
-# 🪟 wincontainer
+# wincontainer
 
-> Run OCI containers on Windows — no Docker, no daemon, no VM overhead.
+Run Linux OCI images on Windows using WSL2 — no Docker Desktop, no Docker daemon, and no traditional container runtime in the execution path.
 
-**wincontainer** is a lightweight container runtime for Windows that uses WSL2 as the execution layer. Pull any image from Docker Hub, run it as a native WSL2 distro, and manage everything through a simple CLI.
+`wincontainer` is an experimental OCI-to-WSL runner for Windows. It pulls Linux OCI images, converts their root filesystem into a lightweight WSL2 distro, and starts the image entrypoint directly through WSL.
 
----
+## Why?
 
-## How it works
+Traditional container workflows on Windows often involve a heavier stack:
 
-Traditional container runtimes on Windows carry a heavy stack:
-
-```
+```text
 your app → Docker daemon → containerd → Linux VM → kernel
 ```
 
-wincontainer cuts straight to the point:
+`wincontainer` keeps the execution path smaller:
 
-```
-your app → WSL2 (already running) → kernel
+```text
+OCI image → WSL2 distro → process
 ```
 
----
+The goal is not to replace Docker or Kubernetes. The goal is to provide a lightweight way to run local Linux workloads on Windows using WSL2 as the execution layer.
 
 ## Features
 
-- **No Docker Desktop required** — works with plain WSL2, which ships with Windows 10/11
-- **Zero network configuration** — all containers share the host network by default, just like native Linux processes
-- **Persistent storage** — data lives inside the WSL2 distro filesystem, which is persistent by nature
-- **Optional volumes** — mount paths from the host when needed
-- **Simple CLI** — `pull`, `start`, `stop`, `list`
-- **Low overhead** — WSL2 uses dynamic memory reclaim; no fixed RAM reservation
-
----
+* **No Docker Desktop required** — uses WSL2 directly.
+* **No Docker daemon** — images are pulled and unpacked by the CLI.
+* **OCI image support** — pulls images from OCI-compatible registries.
+* **WSL2-native execution** — each workload runs as a dedicated WSL2 distro.
+* **Simple networking** — workloads use WSL localhost forwarding; if an app listens on `5432`, use `localhost:5432`.
+* **Persistent filesystem** — data persists inside the WSL2 distro until the workload is deleted.
+* **OCI-declared volumes** — declared volume paths are detected and prepared inside the distro.
+* **Simple CLI** — pull, start, stop, list, logs, stats, delete.
+* **Low local overhead** — no extra Docker daemon/containerd layer during execution.
 
 ## Requirements
 
-- Windows 10 (21H2+) or Windows 11
-- WSL2 enabled (`wsl --install`)
-- Internet access to pull images
-
----
+* Windows 10 21H2+ or Windows 11
+* WSL2 enabled
+* Internet access to pull OCI images
 
 ## Installation
 
-Download the latest `wincontainer.exe` from [Releases](../../releases) and add it to your PATH.
+Download the latest `wincontainer.exe` from Releases and add it to your PATH.
 
 Or clone and build from source:
 
 ```powershell
-git clone https://github.com/your-username/wincontainer
+git clone https://github.com/mateushenriqueab/wincontainer
 cd wincontainer
 go build -o wincontainer.exe .
 ```
-
----
 
 ## Usage
 
 ### Pull an image
 
 ```powershell
-.\wincontainer.exe pull nginx
-.\wincontainer.exe pull rabbitmq:management
+.\wincontainer.exe pull nginx nginx
+.\wincontainer.exe pull rabbitmq:management rabbitmq-management
 ```
 
-### Start a container
+### Start a workload
 
 ```powershell
 .\wincontainer.exe start nginx
-.\wincontainer.exe start rabbitmq-management
+.\wincontainer.exe start rabbitmq-management -d -e RABBITMQ_DEFAULT_USER=user -e RABBITMQ_DEFAULT_PASS=password
 ```
 
-### List running containers
+### List workloads
 
 ```powershell
 .\wincontainer.exe list
 ```
 
-```
-NAME                    DISTRO                              IMAGE                        STATE     VOLUMES
-----                    ------                              -----                        -----     -------
-mysqldb                 winc_mysqldb                        alpine/mysql                 Stopped   -
-rabbitmq-management     winc_rabbitmq-management            rabbitmq:management          Running   /var/lib/rabbitmq
-```
+Example:
 
----
+```text
+NAME                    DISTRO                              IMAGE                        STATE       VOLUMES
+----                    ------                              -----                        -----       -------
+nginx                   winc_nginx                          nginx                        Running     -
+rabbitmq-management     winc_rabbitmq-management            rabbitmq:management          Running     /var/lib/rabbitmq
+```
 
 ## Networking
 
-Because all containers run as WSL2 distros on the same host, they share the Windows host network automatically. No bridge networks, no manual DNS, no `--network` flags.
+`wincontainer` does not implement Docker-style port mapping.
 
-Your Node.js app and your Postgres container talk to each other via `localhost` — exactly like processes on a native Linux machine.
+Instead, it relies on WSL2 localhost forwarding. If a workload listens on a port inside WSL, that same port is available from Windows through `localhost`.
 
----
+Examples:
+
+```text
+PostgreSQL  → localhost:5432
+RabbitMQ    → localhost:5672
+RabbitMQ UI → localhost:15672
+MinIO       → localhost:9000
+MinIO UI    → localhost:9001
+```
+
+## Storage
+
+Each workload is imported as its own WSL2 distro using the `winc_` prefix.
+
+Declared OCI volumes are detected automatically. For example, `rabbitmq:management` declares:
+
+```text
+/var/lib/rabbitmq
+```
+
+`wincontainer` creates that path inside the WSL2 distro and keeps the data there until the workload is deleted.
+
+```text
+winc_rabbitmq-management
+└── /var/lib/rabbitmq
+```
 
 ## Tested images
 
-Over 10 enterprise-grade images validated in a single day across completely different categories:
+Validated local workloads:
 
-| Image | Category | Status |
-|---|---|---|
-| nginx | Web server | ✅ |
-| postgres | Relational database | ✅ |
-| alpine/mysql | Relational database | ✅ |
-| openjdk:19-ea-jdk-alpine3.16 | JVM runtime | ✅ |
-| rabbitmq:management | Message broker | ✅ |
-| keycloak | Auth / IAM | ✅ |
-| grafana | Observability | ✅ |
-| elasticsearch | Search engine | ✅ |
-| camunda/camunda-bpm-platform | BPM / Workflow engine | ✅ |
-| hashicorp/vault | Secrets management | ✅ |
-| minio | Object storage (S3-compatible) | ✅ |
-| apache/kafka | Event streaming | ✅ |
+| Image                 |                     Category | Status |
+| --------------------- | ---------------------------: | :----: |
+| `nginx`               |                   Web server |    ✅   |
+| `redis`               |                        Cache |    ✅   |
+| `postgres`            |          Relational database |    ✅   |
+| `alpine/mysql`        |          Relational database |    ✅   |
+| `openjdk`             |                  JVM runtime |    ✅   |
+| `rabbitmq:management` |               Message broker |    ✅   |
+| `keycloak`            |                   Auth / IAM |    ✅   |
+| `grafana`             |                Observability |    ✅   |
+| `elasticsearch`       |                Search engine |    ✅   |
+| `minio`               | S3-compatible object storage |    ✅   |
+| `apache/kafka`        |              Event streaming |    ✅   |
 
----
+Some images may require additional compatibility work, especially images that rely on systemd, privileged kernel settings, Docker-specific networking, custom users, or shell-less entrypoints.
 
 ## Architecture
 
-```
+```text
 Docker Hub / OCI Registry
         │
-        ▼  (Go: manifest resolution + layer pull + untar + merge)
-   rootfs.tar
+        ▼
+manifest + layers
         │
-        ▼  (wsl --import winc_<name>)
-   WSL2 distro  (winc_<name>)
+        ▼
+rootfs.tar
         │
-        ▼  (wsl -d winc_<name> -- <entrypoint>)
-   running process
+        ▼
+wsl --import winc_<name>
+        │
+        ▼
+WSL2 distro
+        │
+        ▼
+entrypoint/cmd as process
 ```
 
-The `winc_` prefix is used as a namespace convention, allowing `wincontainer list` to distinguish managed containers from regular WSL2 distros without any external state file. No JSON state, no database — WSL itself is the registry.
+The `winc_` prefix is used as a namespace convention so `wincontainer list` can distinguish managed workloads from regular WSL2 distros.
 
----
+## Project status
 
-## Why not just use Docker Desktop?
+This project is experimental and under active development.
 
-- Docker Desktop requires a paid license for companies with 250+ employees
-- It runs a dedicated Linux VM with fixed memory allocation
-- It adds daemon and containerd layers between your app and the kernel
-- It requires manual network configuration for inter-container communication
-- wincontainer uses WSL2, which is already present on modern Windows machines — no installation, no license, no overhead
-
----
-
-## Status
-
-This project is in active development and experimental. APIs and CLI commands may change.
-
----
+It is not affiliated with Microsoft, Docker, or the official Windows Containers platform.
 
 ## License
 
