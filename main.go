@@ -13,11 +13,15 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 )
 
 const (
@@ -27,18 +31,19 @@ const (
 )
 
 type ImageMetadata struct {
-	Image       string   `json:"image"`
-	Distro      string   `json:"distro"`
-	OS          string   `json:"os"`
-	Arch        string   `json:"arch"`
-	Env         []string `json:"env"`
-	Entrypoint  []string `json:"entrypoint"`
-	Cmd         []string `json:"cmd"`
-	WorkingDir  string   `json:"workingDir"`
-	User        string   `json:"user"`
-	Volumes     []string `json:"volumes"`
-	RootFSTar   string   `json:"rootfsTar"`
-	InstallPath string   `json:"installPath"`
+	Image        string   `json:"image"`
+	Distro       string   `json:"distro"`
+	OS           string   `json:"os"`
+	Arch         string   `json:"arch"`
+	Env          []string `json:"env"`
+	Entrypoint   []string `json:"entrypoint"`
+	Cmd          []string `json:"cmd"`
+	WorkingDir   string   `json:"workingDir"`
+	User         string   `json:"user"`
+	Volumes      []string `json:"volumes"`
+	ExposedPorts []string `json:"exposedPorts,omitempty"`
+	RootFSTar    string   `json:"rootfsTar"`
+	InstallPath  string   `json:"installPath"`
 }
 
 type fsEntry struct {
@@ -64,6 +69,19 @@ type WorkloadInfo struct {
 
 type multiFlag []string
 
+type BuildOptions struct {
+	Tag            string
+	DockerfilePath string
+	ContextDir     string
+}
+
+type DockerInstruction struct {
+	Op   string
+	Args string
+	Line int
+	Raw  string
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -71,6 +89,24 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "build":
+		opts, err := parseBuildArgs(os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+
+		if err := runBuild(opts); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+
+	case "push":
+		if err := runPush(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+
 	case "pull":
 		if len(os.Args) < 3 {
 			printUsage()
@@ -155,6 +191,8 @@ func main() {
 
 func printUsage() {
 	fmt.Println("usage:")
+	fmt.Println("  wincontainer build -t <name> [-f Dockerfile] <context>")
+	fmt.Println("  wincontainer push <name> <target-ref>")
 	fmt.Println("  wincontainer pull <image> [name]")
 	fmt.Println("  wincontainer import <image> [name]")
 	fmt.Println("  wincontainer start <name> [-e KEY=value] [-d] [-- command args]")
@@ -164,6 +202,8 @@ func printUsage() {
 	fmt.Println("  wincontainer stats <name>")
 	fmt.Println()
 	fmt.Println("examples:")
+	fmt.Println("  wincontainer build -t my-app .")
+	fmt.Println("  wincontainer push my-app ghcr.io/user/my-app:latest")
 	fmt.Println("  wincontainer pull nginx:alpine nginx")
 	fmt.Println("  wincontainer start nginx")
 	fmt.Println("  wincontainer start nginx -- nginx -g \"daemon off;\"")
@@ -197,6 +237,832 @@ func printUsage() {
 	fmt.Println("naming:")
 	fmt.Println("  Workloads are stored as WSL distros using the prefix winc_.")
 	fmt.Println("  Example: name 'nginx' becomes WSL distro 'winc_nginx'.")
+}
+
+func parseBuildArgs(args []string) (BuildOptions, error) {
+	var opts BuildOptions
+
+	fs := flag.NewFlagSet("build", flag.ContinueOnError)
+	fs.StringVar(&opts.Tag, "t", "", "local image/workload name")
+	fs.StringVar(&opts.DockerfilePath, "f", "Dockerfile", "Dockerfile path")
+
+	if err := fs.Parse(args); err != nil {
+		return opts, err
+	}
+
+	if opts.Tag == "" {
+		return opts, fmt.Errorf("usage: wincontainer build -t <name> [-f Dockerfile] <context>")
+	}
+
+	remaining := fs.Args()
+	if len(remaining) != 1 {
+		return opts, fmt.Errorf("usage: wincontainer build -t <name> [-f Dockerfile] <context>")
+	}
+
+	contextDir, err := filepath.Abs(remaining[0])
+	if err != nil {
+		return opts, err
+	}
+
+	if info, err := os.Stat(contextDir); err != nil {
+		return opts, err
+	} else if !info.IsDir() {
+		return opts, fmt.Errorf("build context is not a directory: %s", contextDir)
+	}
+
+	dockerfilePath := opts.DockerfilePath
+	if !filepath.IsAbs(dockerfilePath) {
+		dockerfilePath = filepath.Join(contextDir, dockerfilePath)
+	}
+
+	opts.ContextDir = contextDir
+	opts.DockerfilePath = dockerfilePath
+	opts.Tag = displayNameFromDistro(normalizeDistroName(opts.Tag))
+
+	return opts, nil
+}
+
+func runBuild(opts BuildOptions) error {
+	instructions, err := parseDockerfile(opts.DockerfilePath)
+	if err != nil {
+		return err
+	}
+
+	if len(instructions) == 0 || instructions[0].Op != "FROM" {
+		return fmt.Errorf("Dockerfile must start with FROM")
+	}
+
+	baseImage, err := parseFromImage(instructions[0].Args)
+	if err != nil {
+		return err
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	finalDistro := normalizeDistroName(opts.Tag)
+	finalSafe := sanitizeName(finalDistro)
+	finalWorkDir := filepath.Join(home, ".wincontainer", "work", finalSafe)
+	finalInstallDir := filepath.Join(home, ".wincontainer", "distros", finalSafe)
+	finalRootFSTar := filepath.Join(finalWorkDir, "rootfs.tar")
+	finalMetadataPath := filepath.Join(finalWorkDir, "metadata.json")
+
+	buildID := fmt.Sprintf("%d", time.Now().UnixNano())
+	builderDistro := normalizeDistroName("build-" + sanitizeName(opts.Tag) + "-" + buildID)
+	builderSafe := sanitizeName(builderDistro)
+
+	fmt.Println("==> parsing Dockerfile:", opts.DockerfilePath)
+	fmt.Println("==> build context:", opts.ContextDir)
+	fmt.Println("==> resolving base image:", baseImage)
+
+	baseMeta, err := runPull(baseImage, builderDistro)
+	if err != nil {
+		return err
+	}
+
+	cleanupBuilder := func() {
+		_ = exec.Command("wsl.exe", "--terminate", builderDistro).Run()
+		_ = exec.Command("wsl.exe", "--unregister", builderDistro).Run()
+		_ = os.RemoveAll(filepath.Join(home, ".wincontainer", "work", builderSafe))
+		_ = os.RemoveAll(filepath.Join(home, ".wincontainer", "distros", builderSafe))
+	}
+	defer cleanupBuilder()
+
+	fmt.Println("==> importing builder distro:", builderDistro)
+	if err := importDistro(*baseMeta); err != nil {
+		return err
+	}
+
+	if err := ensureWSLRuntimeConfig(builderDistro); err != nil {
+		return err
+	}
+
+	meta := *baseMeta
+	meta.Image = opts.Tag
+	meta.Distro = finalDistro
+	meta.RootFSTar = finalRootFSTar
+	meta.InstallPath = finalInstallDir
+
+	for index, inst := range instructions[1:] {
+		fmt.Printf("==> applying instruction %d/%d: %s %s\n", index+1, len(instructions)-1, inst.Op, inst.Args)
+
+		if err := applyBuildInstruction(builderDistro, opts.ContextDir, &meta, inst); err != nil {
+			return fmt.Errorf("Dockerfile line %d (%s): %w", inst.Line, inst.Raw, err)
+		}
+	}
+
+	fmt.Println("==> exporting final rootfs")
+	if err := os.MkdirAll(finalWorkDir, 0755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(finalInstallDir, 0755); err != nil {
+		return err
+	}
+
+	if err := exportDistroRootFS(builderDistro, finalRootFSTar); err != nil {
+		return err
+	}
+
+	if err := writeJSON(finalMetadataPath, meta); err != nil {
+		return err
+	}
+
+	fmt.Println()
+	fmt.Println("✅ built:", opts.Tag)
+	fmt.Println("name:    ", displayNameFromDistro(meta.Distro))
+	fmt.Println("distro:  ", meta.Distro)
+	fmt.Println("base:    ", baseImage)
+	fmt.Println("metadata:", finalMetadataPath)
+	fmt.Println("rootfs:  ", finalRootFSTar)
+
+	if len(meta.Volumes) > 0 {
+		fmt.Println()
+		fmt.Println("⚠️  declared persistent volumes:")
+		for _, volume := range meta.Volumes {
+			fmt.Println("   ", volume)
+		}
+	}
+
+	return nil
+}
+
+func runPush(args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: wincontainer push <name> <target-ref>")
+	}
+
+	sourceName := args[0]
+	targetRef := args[1]
+
+	meta, err := loadMetadata(sourceName)
+	if err != nil {
+		return err
+	}
+
+	return pushImage(*meta, targetRef)
+}
+
+func pushImage(meta ImageMetadata, targetRef string) error {
+	if strings.TrimSpace(meta.RootFSTar) == "" {
+		return fmt.Errorf("metadata has no rootfsTar")
+	}
+
+	if _, err := os.Stat(meta.RootFSTar); err != nil {
+		return fmt.Errorf("rootfs not found for %s: %w", displayNameFromDistro(meta.Distro), err)
+	}
+
+	if meta.OS == "" {
+		meta.OS = "linux"
+	}
+	if meta.Arch == "" {
+		meta.Arch = "amd64"
+	}
+
+	ref, err := name.ParseReference(targetRef, name.WeakValidation)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("==> loading local workload:", displayNameFromDistro(meta.Distro))
+	fmt.Println("==> rootfs:", meta.RootFSTar)
+	fmt.Println("==> target:", targetRef)
+	fmt.Println("==> creating OCI layer from rootfs")
+
+	layer, err := tarball.LayerFromFile(meta.RootFSTar)
+	if err != nil {
+		return err
+	}
+
+	img, err := mutate.AppendLayers(empty.Image, layer)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return err
+	}
+
+	cfg.OS = meta.OS
+	cfg.Architecture = meta.Arch
+	cfg.Config.Env = append([]string{}, meta.Env...)
+	cfg.Config.Entrypoint = append([]string{}, meta.Entrypoint...)
+	cfg.Config.Cmd = append([]string{}, meta.Cmd...)
+	cfg.Config.WorkingDir = meta.WorkingDir
+	cfg.Config.User = meta.User
+	cfg.Config.Volumes = stringSetMap(meta.Volumes)
+	cfg.Config.ExposedPorts = stringSetMap(meta.ExposedPorts)
+
+	img, err = mutate.ConfigFile(img, cfg)
+	if err != nil {
+		return err
+	}
+
+	digest, digestErr := img.Digest()
+
+	fmt.Println("==> pushing:", targetRef)
+	if err := remote.Write(
+		ref,
+		img,
+		remote.WithAuthFromKeychain(authn.DefaultKeychain),
+	); err != nil {
+		return err
+	}
+
+	fmt.Println()
+	fmt.Println("✅ pushed:", targetRef)
+	if digestErr == nil {
+		fmt.Println("digest:  ", digest.String())
+	}
+	fmt.Println()
+	fmt.Println("You can test it with:")
+	fmt.Println("  docker run --rm " + targetRef)
+
+	return nil
+}
+
+func stringSetMap(values []string) map[string]struct{} {
+	result := map[string]struct{}{}
+
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+
+		result[value] = struct{}{}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+
+	return result
+}
+
+func parseDockerfile(dockerfilePath string) ([]DockerInstruction, error) {
+	b, err := os.ReadFile(dockerfilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(string(b), "\n")
+	instructions := []DockerInstruction{}
+
+	current := ""
+	currentLine := 0
+
+	for i, raw := range lines {
+		lineNo := i + 1
+		line := strings.TrimSpace(raw)
+
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if current == "" {
+			currentLine = lineNo
+		}
+
+		if strings.HasSuffix(line, "\\") {
+			current += strings.TrimSpace(strings.TrimSuffix(line, "\\")) + " "
+			continue
+		}
+
+		current += line
+
+		inst, err := parseDockerfileInstruction(current, currentLine)
+		if err != nil {
+			return nil, err
+		}
+
+		instructions = append(instructions, inst)
+		current = ""
+		currentLine = 0
+	}
+
+	if strings.TrimSpace(current) != "" {
+		inst, err := parseDockerfileInstruction(current, currentLine)
+		if err != nil {
+			return nil, err
+		}
+		instructions = append(instructions, inst)
+	}
+
+	return instructions, nil
+}
+
+func parseDockerfileInstruction(line string, lineNo int) (DockerInstruction, error) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return DockerInstruction{}, fmt.Errorf("empty Dockerfile instruction")
+	}
+
+	op := strings.ToUpper(fields[0])
+	args := strings.TrimSpace(line[len(fields[0]):])
+
+	return DockerInstruction{
+		Op:   op,
+		Args: args,
+		Line: lineNo,
+		Raw:  line,
+	}, nil
+}
+
+func parseFromImage(args string) (string, error) {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return "", fmt.Errorf("FROM requires an image")
+	}
+
+	for len(fields) > 0 && strings.HasPrefix(fields[0], "--") {
+		fields = fields[1:]
+	}
+
+	if len(fields) == 0 {
+		return "", fmt.Errorf("FROM requires an image")
+	}
+
+	return fields[0], nil
+}
+
+func applyBuildInstruction(builderDistro string, contextDir string, meta *ImageMetadata, inst DockerInstruction) error {
+	switch inst.Op {
+	case "RUN":
+		if strings.TrimSpace(inst.Args) == "" {
+			return fmt.Errorf("RUN requires a command")
+		}
+		return runBuildShell(builderDistro, meta, inst.Args)
+
+	case "WORKDIR":
+		workdir := normalizeContainerPath(inst.Args, meta.WorkingDir)
+		if workdir == "" {
+			return fmt.Errorf("WORKDIR requires a path")
+		}
+		meta.WorkingDir = workdir
+		return runBuilderCommand(builderDistro, "mkdir -p "+shellQuote(workdir))
+
+	case "COPY", "ADD":
+		copies, err := parseCopyLike(inst.Args)
+		if err != nil {
+			return err
+		}
+		return applyBuildCopy(builderDistro, contextDir, meta.WorkingDir, copies)
+
+	case "ENV":
+		envs, err := parseDockerfileEnv(inst.Args)
+		if err != nil {
+			return err
+		}
+		for _, kv := range envs {
+			key, _, _, err := parseEnvironment(kv)
+			if err != nil {
+				return err
+			}
+			meta.Env = setEnvValue(meta.Env, key, kv)
+		}
+		return nil
+
+	case "EXPOSE":
+		ports := strings.Fields(inst.Args)
+		if len(ports) == 0 {
+			return fmt.Errorf("EXPOSE requires at least one port")
+		}
+		for _, port := range ports {
+			meta.ExposedPorts = appendUnique(meta.ExposedPorts, normalizeExposedPort(port))
+		}
+		sort.Strings(meta.ExposedPorts)
+		return nil
+
+	case "VOLUME":
+		volumes, err := parseStringListOrFields(inst.Args)
+		if err != nil {
+			return err
+		}
+		if len(volumes) == 0 {
+			return fmt.Errorf("VOLUME requires at least one path")
+		}
+		for _, volume := range volumes {
+			volume = normalizeContainerPath(volume, meta.WorkingDir)
+			if volume == "" {
+				continue
+			}
+			meta.Volumes = appendUnique(meta.Volumes, volume)
+			if err := runBuilderCommand(builderDistro, "mkdir -p "+shellQuote(volume)); err != nil {
+				return err
+			}
+		}
+		sort.Strings(meta.Volumes)
+		return nil
+
+	case "USER":
+		meta.User = strings.TrimSpace(inst.Args)
+		return nil
+
+	case "CMD":
+		cmd, err := parseCommandInstruction(inst.Args)
+		if err != nil {
+			return err
+		}
+		meta.Cmd = cmd
+		return nil
+
+	case "ENTRYPOINT":
+		entrypoint, err := parseCommandInstruction(inst.Args)
+		if err != nil {
+			return err
+		}
+		meta.Entrypoint = entrypoint
+		return nil
+
+	case "LABEL", "ARG", "SHELL", "STOPSIGNAL", "HEALTHCHECK", "ONBUILD":
+		fmt.Println("    warning: instruction ignored in this build MVP:", inst.Op)
+		return nil
+
+	default:
+		return fmt.Errorf("unsupported instruction %s", inst.Op)
+	}
+}
+
+func runBuildShell(builderDistro string, meta *ImageMetadata, command string) error {
+	lines := []string{}
+
+	if meta.WorkingDir != "" {
+		lines = append(lines, "cd "+shellQuote(meta.WorkingDir))
+	}
+
+	allEnv := append([]string{}, meta.Env...)
+	envArgs := []string{}
+	for _, kv := range allEnv {
+		key, value, hasValue, err := parseEnvironment(kv)
+		if err != nil || !hasValue {
+			continue
+		}
+		envArgs = append(envArgs, key+"="+value)
+	}
+
+	runCommand := "sh -lc " + shellQuote(command)
+	if len(envArgs) > 0 {
+		runCommand = "env " + shellJoin(envArgs) + " " + runCommand
+	}
+
+	lines = append(lines, runCommand)
+	return runBuilderCommand(builderDistro, strings.Join(lines, " && "))
+}
+
+func runBuilderCommand(builderDistro string, script string) error {
+	cmd := exec.Command("wsl.exe", "-d", builderDistro, "--cd", "/", "--", "sh", "-lc", script)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
+}
+
+type CopySpec struct {
+	Sources []string
+	Dest    string
+}
+
+func parseCopyLike(args string) (CopySpec, error) {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return CopySpec{}, fmt.Errorf("COPY requires source and destination")
+	}
+
+	if strings.HasPrefix(args, "[") {
+		values, err := parseJSONStringArray(args)
+		if err != nil {
+			return CopySpec{}, err
+		}
+		if len(values) < 2 {
+			return CopySpec{}, fmt.Errorf("COPY JSON form requires at least source and destination")
+		}
+		return CopySpec{Sources: values[:len(values)-1], Dest: values[len(values)-1]}, nil
+	}
+
+	fields := strings.Fields(args)
+	filtered := []string{}
+	for _, field := range fields {
+		if strings.HasPrefix(field, "--from=") || field == "--from" {
+			return CopySpec{}, fmt.Errorf("COPY --from is not supported in build MVP")
+		}
+		if strings.HasPrefix(field, "--") {
+			continue
+		}
+		filtered = append(filtered, field)
+	}
+
+	if len(filtered) < 2 {
+		return CopySpec{}, fmt.Errorf("COPY requires source and destination")
+	}
+
+	return CopySpec{Sources: filtered[:len(filtered)-1], Dest: filtered[len(filtered)-1]}, nil
+}
+
+func applyBuildCopy(builderDistro string, contextDir string, workingDir string, spec CopySpec) error {
+	if len(spec.Sources) == 0 {
+		return fmt.Errorf("COPY requires source")
+	}
+
+	dest := normalizeContainerPath(spec.Dest, workingDir)
+	if dest == "" {
+		return fmt.Errorf("COPY destination is empty")
+	}
+
+	multipleSources := len(spec.Sources) > 1
+	destIsDir := multipleSources || strings.HasSuffix(spec.Dest, "/") || strings.HasSuffix(spec.Dest, "\\") || remotePathIsDir(builderDistro, dest)
+
+	tmpTar, err := os.CreateTemp("", "wincontainer-copy-*.tar")
+	if err != nil {
+		return err
+	}
+	tmpTarPath := tmpTar.Name()
+	defer os.Remove(tmpTarPath)
+
+	tw := tar.NewWriter(tmpTar)
+
+	for _, src := range spec.Sources {
+		src = strings.Trim(src, `"'`)
+		if src == "" {
+			continue
+		}
+
+		srcPath := filepath.Join(contextDir, filepath.FromSlash(src))
+		srcPath, err = filepath.Abs(srcPath)
+		if err != nil {
+			_ = tw.Close()
+			_ = tmpTar.Close()
+			return err
+		}
+
+		if !isPathWithin(srcPath, contextDir) {
+			_ = tw.Close()
+			_ = tmpTar.Close()
+			return fmt.Errorf("COPY source escapes build context: %s", src)
+		}
+
+		info, err := os.Stat(srcPath)
+		if err != nil {
+			_ = tw.Close()
+			_ = tmpTar.Close()
+			return err
+		}
+
+		target := dest
+		srcClean := path.Clean(filepath.ToSlash(src))
+		if destIsDir && srcClean != "." {
+			target = path.Join(dest, info.Name())
+		}
+
+		if err := addPathToTar(tw, srcPath, target); err != nil {
+			_ = tw.Close()
+			_ = tmpTar.Close()
+			return err
+		}
+	}
+
+	if err := tw.Close(); err != nil {
+		_ = tmpTar.Close()
+		return err
+	}
+	if err := tmpTar.Close(); err != nil {
+		return err
+	}
+
+	f, err := os.Open(tmpTarPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	cmd := exec.Command("wsl.exe", "-d", builderDistro, "--cd", "/", "--", "tar", "-C", "/", "-xf", "-")
+	cmd.Stdin = f
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("extract COPY tar into builder: %w", err)
+	}
+
+	return nil
+}
+
+func remotePathIsDir(builderDistro string, remotePath string) bool {
+	cmd := exec.Command("wsl.exe", "-d", builderDistro, "--cd", "/", "--", "sh", "-lc", "[ -d "+shellQuote(remotePath)+" ]")
+	return cmd.Run() == nil
+}
+
+func addPathToTar(tw *tar.Writer, srcPath string, destPath string) error {
+	info, err := os.Lstat(srcPath)
+	if err != nil {
+		return err
+	}
+
+	destPath = strings.TrimPrefix(path.Clean("/"+filepath.ToSlash(destPath)), "/")
+	if destPath == "." || destPath == "" {
+		return fmt.Errorf("invalid COPY destination")
+	}
+
+	if info.IsDir() {
+		return filepath.Walk(srcPath, func(current string, currentInfo os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+
+			rel, err := filepath.Rel(srcPath, current)
+			if err != nil {
+				return err
+			}
+
+			target := destPath
+			if rel != "." {
+				target = path.Join(destPath, filepath.ToSlash(rel))
+			}
+
+			return writeTarEntry(tw, current, target, currentInfo)
+		})
+	}
+
+	return writeTarEntry(tw, srcPath, destPath, info)
+}
+
+func writeTarEntry(tw *tar.Writer, srcPath string, destPath string, info os.FileInfo) error {
+	hdr, err := tar.FileInfoHeader(info, "")
+	if err != nil {
+		return err
+	}
+
+	hdr.Name = strings.TrimPrefix(path.Clean("/"+filepath.ToSlash(destPath)), "/")
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		link, err := os.Readlink(srcPath)
+		if err != nil {
+			return err
+		}
+		hdr.Linkname = link
+	}
+
+	if err := tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+
+	if info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	_, err = io.Copy(tw, f)
+	return err
+}
+
+func parseDockerfileEnv(args string) ([]string, error) {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return nil, fmt.Errorf("ENV requires arguments")
+	}
+
+	if strings.Contains(args, "=") {
+		fields := strings.Fields(args)
+		result := []string{}
+
+		for _, field := range fields {
+			key, value, hasValue, err := parseEnvironment(field)
+			if err != nil || !hasValue {
+				return nil, fmt.Errorf("invalid ENV assignment %q", field)
+			}
+			result = append(result, key+"="+value)
+		}
+
+		return result, nil
+	}
+
+	parts := strings.Fields(args)
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("ENV requires KEY VALUE or KEY=VALUE")
+	}
+
+	return []string{parts[0] + "=" + strings.Join(parts[1:], " ")}, nil
+}
+
+func setEnvValue(env []string, key string, kv string) []string {
+	result := []string{}
+
+	for _, existing := range env {
+		existingKey, _, _, err := parseEnvironment(existing)
+		if err == nil && existingKey == key {
+			continue
+		}
+		result = append(result, existing)
+	}
+
+	return append(result, kv)
+}
+
+func appendUnique(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+
+	return append(values, value)
+}
+
+func normalizeExposedPort(portValue string) string {
+	portValue = strings.TrimSpace(portValue)
+	if portValue == "" {
+		return portValue
+	}
+
+	if strings.Contains(portValue, "/") {
+		return portValue
+	}
+
+	return portValue + "/tcp"
+}
+
+func parseStringListOrFields(args string) ([]string, error) {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return []string{}, nil
+	}
+
+	if strings.HasPrefix(args, "[") {
+		return parseJSONStringArray(args)
+	}
+
+	return strings.Fields(args), nil
+}
+
+func parseCommandInstruction(args string) ([]string, error) {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return []string{}, nil
+	}
+
+	if strings.HasPrefix(args, "[") {
+		return parseJSONStringArray(args)
+	}
+
+	return []string{"/bin/sh", "-c", args}, nil
+}
+
+func parseJSONStringArray(value string) ([]string, error) {
+	var result []string
+	if err := json.Unmarshal([]byte(value), &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func normalizeContainerPath(value string, workingDir string) string {
+	value = strings.TrimSpace(strings.Trim(value, `"'`))
+	if value == "" {
+		return ""
+	}
+
+	value = strings.ReplaceAll(value, "\\", "/")
+
+	if strings.HasPrefix(value, "/") {
+		return path.Clean(value)
+	}
+
+	if workingDir == "" {
+		workingDir = "/"
+	}
+
+	return path.Clean(path.Join(workingDir, value))
+}
+
+func isPathWithin(candidate string, root string) bool {
+	candidate = filepath.Clean(candidate)
+	root = filepath.Clean(root)
+
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+
+	return rel == "." || (!strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && rel != "..")
+}
+
+func exportDistroRootFS(distroName string, outTar string) error {
+	cmd := exec.Command("wsl.exe", "--export", distroName, outTar)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func runImport(imageRef string, distroName string) error {
@@ -256,18 +1122,19 @@ func runPull(imageRef string, distroName string) (*ImageMetadata, error) {
 	}
 
 	meta := ImageMetadata{
-		Image:       imageRef,
-		Distro:      distroName,
-		OS:          cfg.OS,
-		Arch:        cfg.Architecture,
-		Env:         cfg.Config.Env,
-		Entrypoint:  cfg.Config.Entrypoint,
-		Cmd:         cfg.Config.Cmd,
-		WorkingDir:  cfg.Config.WorkingDir,
-		User:        cfg.Config.User,
-		Volumes:     extractVolumes(cfg),
-		RootFSTar:   rootfsTar,
-		InstallPath: installDir,
+		Image:        imageRef,
+		Distro:       distroName,
+		OS:           cfg.OS,
+		Arch:         cfg.Architecture,
+		Env:          cfg.Config.Env,
+		Entrypoint:   cfg.Config.Entrypoint,
+		Cmd:          cfg.Config.Cmd,
+		WorkingDir:   cfg.Config.WorkingDir,
+		User:         cfg.Config.User,
+		Volumes:      extractVolumes(cfg),
+		ExposedPorts: extractExposedPorts(cfg),
+		RootFSTar:    rootfsTar,
+		InstallPath:  installDir,
 	}
 
 	fmt.Println("==> metadata")
@@ -279,6 +1146,7 @@ func runPull(imageRef string, distroName string) (*ImageMetadata, error) {
 	fmt.Println("    workdir:   ", meta.WorkingDir)
 	fmt.Println("    user:      ", meta.User)
 	fmt.Println("    volumes:   ", strings.Join(meta.Volumes, " "))
+	fmt.Println("    expose:    ", strings.Join(meta.ExposedPorts, " "))
 
 	fmt.Println("==> building rootfs.tar")
 	if err := buildRootFSTar(img, rootfsTar, workDir); err != nil {
@@ -327,6 +1195,21 @@ func extractVolumes(cfg *v1.ConfigFile) []string {
 	sort.Strings(volumes)
 
 	return volumes
+}
+
+func extractExposedPorts(cfg *v1.ConfigFile) []string {
+	ports := []string{}
+
+	for port := range cfg.Config.ExposedPorts {
+		port = strings.TrimSpace(port)
+		if port == "" {
+			continue
+		}
+		ports = append(ports, port)
+	}
+
+	sort.Strings(ports)
+	return ports
 }
 
 func runStart(opts StartOptions) error {
@@ -939,6 +1822,7 @@ func applyLayer(r io.Reader, entries map[string]*fsEntry, blobDir string) error 
 
 func writeMergedTar(outTar string, entries map[string]*fsEntry) error {
 	injectWSLRuntimeConfig(entries)
+	materializeHardLinks(entries)
 
 	f, err := os.Create(outTar)
 	if err != nil {
@@ -1003,6 +1887,85 @@ func writeMergedTar(outTar string, entries map[string]*fsEntry) error {
 	}
 
 	return nil
+}
+
+func materializeHardLinks(entries map[string]*fsEntry) {
+	for name, entry := range entries {
+		if entry == nil || entry.Header == nil || entry.Header.Typeflag != tar.TypeLink {
+			continue
+		}
+
+		target := resolveHardLinkEntry(entries, name, entry.Header.Linkname, map[string]bool{})
+		if target == nil || target.Header == nil {
+			continue
+		}
+
+		if target.Header.Typeflag != tar.TypeReg && target.Header.Typeflag != tar.TypeRegA {
+			continue
+		}
+
+		h := *entry.Header
+		h.Typeflag = tar.TypeReg
+		h.Linkname = ""
+		h.Size = target.Header.Size
+		if h.Mode == 0 {
+			h.Mode = target.Header.Mode
+		}
+
+		entries[name] = &fsEntry{
+			Header:  &h,
+			Blob:    target.Blob,
+			Content: target.Content,
+		}
+	}
+}
+
+func resolveHardLinkEntry(entries map[string]*fsEntry, currentName string, linkName string, seen map[string]bool) *fsEntry {
+	for _, candidate := range hardLinkTargetCandidates(currentName, linkName) {
+		if seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+
+		entry := entries[candidate]
+		if entry == nil || entry.Header == nil {
+			continue
+		}
+
+		if entry.Header.Typeflag == tar.TypeLink {
+			resolved := resolveHardLinkEntry(entries, candidate, entry.Header.Linkname, seen)
+			if resolved != nil {
+				return resolved
+			}
+			continue
+		}
+
+		return entry
+	}
+
+	return nil
+}
+
+func hardLinkTargetCandidates(currentName string, linkName string) []string {
+	seen := map[string]bool{}
+	candidates := []string{}
+
+	add := func(value string) {
+		clean, ok := cleanTarName(value)
+		if !ok || seen[clean] {
+			return
+		}
+		seen[clean] = true
+		candidates = append(candidates, clean)
+	}
+
+	add(linkName)
+
+	if linkName != "" && !strings.HasPrefix(linkName, "/") {
+		add(path.Join(path.Dir(currentName), linkName))
+	}
+
+	return candidates
 }
 
 func injectWSLRuntimeConfig(entries map[string]*fsEntry) {
